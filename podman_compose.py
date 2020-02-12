@@ -17,6 +17,11 @@ import time
 import re
 import hashlib
 import random
+import json
+
+from threading import Thread
+
+import shlex
 
 try:
     from shlex import quote as cmd_quote
@@ -29,6 +34,8 @@ except ImportError:
 import json
 import yaml
 
+__version__ = '0.1.6dev'
+
 PY3 = sys.version_info[0] == 3
 if PY3:
     basestring = str
@@ -38,6 +45,8 @@ if PY3:
 is_str  = lambda s: isinstance(s, basestring)
 is_dict = lambda d: isinstance(d, dict)
 is_list = lambda l: not is_str(l) and not is_dict(l) and hasattr(l, "__iter__")
+# identity filter
+filteri = lambda a: filter(lambda i:i, a)
 
 def try_int(i, fallback=None):
     try:
@@ -51,6 +60,10 @@ def try_int(i, fallback=None):
 dir_re = re.compile("^[~/\.]")
 propagation_re=re.compile("^(?:z|Z|r?shared|r?slave|r?private)$")
 
+# NOTE: if a named volume is used but not defined it gives
+# ERROR: Named volume "so and so" is used in service "xyz" but no declaration was found in the volumes section.
+# unless it's anon-volume
+
 def parse_short_mount(mount_str, basedir):
     mount_a = mount_str.split(':')
     mount_opt_dict = {}
@@ -61,6 +74,7 @@ def parse_short_mount(mount_str, basedir):
         mount_src, mount_dst=None, mount_str
     elif len(mount_a)==2:
         mount_src, mount_dst = mount_a
+        # dest must start with /, otherwise it's option
         if not mount_dst.startswith('/'):
             mount_dst, mount_opt = mount_a
             mount_src = None
@@ -82,25 +96,37 @@ def parse_short_mount(mount_str, basedir):
         # Named volume
         # - datavolume:/var/lib/mysql
         mount_type = "volume"
-    mount_opts = filter(lambda i:i, (mount_opt or '').split(','))
+    mount_opts = filteri((mount_opt or '').split(','))
     for opt in mount_opts:
         if opt=='ro': mount_opt_dict["read_only"]=True
         elif opt=='rw': mount_opt_dict["read_only"]=False
+        elif opt=='delegated': mount_opt_dict["delegated"]=dict(propagation=opt)
+        elif opt=='cached': mount_opt_dict["cached"]=dict(propagation=opt)
         elif propagation_re.match(opt): mount_opt_dict["bind"]=dict(propagation=opt)
         else:
             # TODO: ignore
             raise ValueError("unknown mount option "+opt)
     return dict(type=mount_type, source=mount_src, target=mount_dst, **mount_opt_dict)
 
-def fix_mount_dict(mount_dict, srv_name, cnt_name):
+def fix_mount_dict(mount_dict, proj_name, srv_name):
     """
-    in-place fix mount dictionary to add missing source
+    in-place fix mount dictionary to:
+    - add missing source
+    - prefix source with proj_name
     """
-    if mount_dict["type"]=="volume" and not mount_dict.get("source"):
-        mount_dict["source"] = "_".join([
-            srv_name, cnt_name,
-            hashlib.md5(mount_dict["target"].encode("utf-8")).hexdigest(),
-        ])
+    if mount_dict["type"]=="volume":
+        source = mount_dict.get("source")
+        # keep old source
+        mount_dict["_source"] = source
+        if not source:
+            # missing source
+            mount_dict["source"] = "_".join([
+                proj_name, srv_name,
+                hashlib.md5(mount_dict["target"].encode("utf-8")).hexdigest(),
+            ])
+        else:
+            # prefix with proj_name
+            mount_dict["source"] = proj_name+"_"+source
     return mount_dict
 
 # docker and docker-compose support subset of bash variable substitution
@@ -181,9 +207,23 @@ def norm_as_dict(src):
     elif is_list(src):
         dst = [i.split("=", 1) for i in src if i]
         dst = dict([(a if len(a) == 2 else (a[0], None)) for a in dst])
+    elif is_str(src):
+        key, value = src.split("=", 1) if "=" in src else (src, None)
+        dst = {key: value}
     else:
         raise ValueError("dictionary or iterable is expected")
     return dst
+
+def norm_ulimit(inner_value):
+    if is_dict(inner_value):
+        if not inner_value.keys() & {"soft", "hard"}:
+            raise ValueError("expected at least one soft or hard limit")
+        soft = inner_value.get("soft", inner_value.get("hard"))
+        hard = inner_value.get("hard", inner_value.get("soft"))
+        return "{}:{}".format(soft, hard)
+    elif is_list(inner_value): return norm_ulimit(norm_as_dict(inner_value))
+    # if int or string return as is
+    return inner_value
 
 
 # transformation helpers
@@ -335,21 +375,25 @@ def mount_dict_vol_to_bind(compose, mount_dict):
     proj_name = compose.project_name
     shared_vols = compose.shared_vols
     if mount_dict["type"]!="volume": return mount_dict
+    vol_name_orig = mount_dict.get("_source", None)
     vol_name = mount_dict["source"]
     print("podman volume inspect {vol_name} || podman volume create {vol_name}".format(vol_name=vol_name))
     # podman volume list --format '{{.Name}}\t{{.MountPoint}}' -f 'label=io.podman.compose.project=HERE'
-    try: out = compose.podman.output(["volume", "inspect", vol_name])
+    try: out = compose.podman.output(["volume", "inspect", vol_name]).decode('utf-8')
     except subprocess.CalledProcessError:
-        compose.podman.output(["volume", "create", "-l", "io.podman.compose.project={}".format(proj_name), vol_name])
-        out = compose.podman.output(["volume", "inspect", vol_name])
-    src = json.loads(out)[0]["mountPoint"]
+        compose.podman.output(["volume", "create", "--label", "io.podman.compose.project={}".format(proj_name), vol_name])
+        out = compose.podman.output(["volume", "inspect", vol_name]).decode('utf-8')
+    try:
+        src = json.loads(out)[0]["mountPoint"]
+    except KeyError:
+        src = json.loads(out)[0]["Mountpoint"]
     ret=dict(mount_dict, type="bind", source=src, _vol=vol_name)
     bind_prop=ret.get("bind", {}).get("propagation")
     if not bind_prop:
         if "bind" not in ret:
             ret["bind"]={}
         # if in top level volumes then it's shared bind-propagation=z
-        if vol_name in shared_vols:
+        if vol_name_orig and vol_name_orig in shared_vols:
             ret["bind"]["propagation"]="z"
         else:
             ret["bind"]["propagation"]="Z"
@@ -362,7 +406,9 @@ def mount_desc_to_args(compose, mount_desc, srv_name, cnt_name):
     proj_name = compose.project_name
     shared_vols = compose.shared_vols
     if is_str(mount_desc): mount_desc=parse_short_mount(mount_desc, basedir)
-    mount_desc = mount_dict_vol_to_bind(compose, fix_mount_dict(mount_desc, srv_name, cnt_name))
+    # not needed
+    # podman support: podman run --rm -ti --mount type=volume,source=myvol,destination=/delme busybox
+    mount_desc = mount_dict_vol_to_bind(compose, fix_mount_dict(mount_desc, proj_name, srv_name))
     mount_type = mount_desc.get("type")
     source = mount_desc.get("source")
     target = mount_desc["target"]
@@ -396,12 +442,13 @@ def mount_desc_to_args(compose, mount_desc, srv_name, cnt_name):
 
 
 
-def container_to_args(compose, cnt, detached=True):
+def container_to_args(compose, cnt, detached=True, podman_command='run'):
+    # TODO: double check -e , --add-host, -v, --read-only
     dirname = compose.dirname
     shared_vols = compose.shared_vols
     pod = cnt.get('pod') or ''
     podman_args = [
-        'run',
+        podman_command,
         '--name={}'.format(cnt.get('name')),
     ]
 
@@ -416,11 +463,13 @@ def container_to_args(compose, cnt, detached=True):
     if cnt.get('read_only'):
         podman_args.append('--read-only')
     for i in cnt.get('labels', []):
-        podman_args.extend(['-l', i])
+        podman_args.extend(['--label', i])
     net = cnt.get("network_mode")
     if net:
         podman_args.extend(['--network', net])
     env = norm_as_list(cnt.get('environment', {}))
+    for d in cnt.get('devices', []):
+        podman_args.extend(['--device', d])
     for e in env:
         podman_args.extend(['-e', e])
     for i in cnt.get('env_file', []):
@@ -455,6 +504,19 @@ def container_to_args(compose, cnt, detached=True):
         podman_args.append('-i')
     if cnt.get('tty'):
         podman_args.append('--tty')
+    if cnt.get('privileged'):
+        podman_args.append('--privileged')
+    ulimit = cnt.get('ulimits', [])
+    if ulimit is not None:
+        # ulimit can be a single value, i.e. ulimit: host
+        if is_str(ulimit):
+            podman_args.extend(['--ulimit', ulimit])
+        # or a dictionary or list:
+        else:
+            ulimit = norm_as_dict(ulimit)
+            ulimit = [ "{}={}".format(ulimit_key, norm_ulimit(inner_value)) for ulimit_key, inner_value in ulimit.items()]
+            for i in ulimit:
+                podman_args.extend(['--ulimit', i])
     # currently podman shipped by fedora does not package this
     # if cnt.get('init'):
     #    args.append('--init')
@@ -513,37 +575,50 @@ def container_to_args(compose, cnt, detached=True):
     command = cnt.get('command')
     if command is not None:
         if is_str(command):
-            podman_args.extend([command])
+            podman_args.extend(shlex.split(command))
         else:
             podman_args.extend(command)
     return podman_args
 
-
-def rec_deps(services, container_by_name, cnt, init_service):
-    deps = cnt["_deps"]
-    for dep in deps.copy():
-        dep_cnts = services.get(dep)
-        if not dep_cnts:
+def rec_deps(services, service_name, start_point=None):
+    """
+    return all dependencies of service_name recursively
+    """
+    if not start_point:
+        start_point = service_name
+    deps = services[service_name]["_deps"]
+    for dep_name in deps.copy():
+        # avoid A depens on A
+        if dep_name==service_name:
             continue
-        dep_cnt = container_by_name.get(dep_cnts[0])
-        if dep_cnt:
-            # TODO: avoid creating loops, A->B->A
-            if init_service and init_service in dep_cnt["_deps"]:
-                continue
-            new_deps = rec_deps(services, container_by_name,
-                                dep_cnt, init_service)
-            deps.update(new_deps)
+        dep_srv = services.get(dep_name)
+        if not dep_srv:
+            continue
+        # NOTE: avoid creating loops, A->B->A
+        if start_point and start_point in dep_srv["_deps"]:
+            continue
+        new_deps = rec_deps(services, dep_name, start_point)
+        deps.update(new_deps)
     return deps
 
-
-def flat_deps(services, container_by_name):
-    for name, cnt in container_by_name.items():
-        deps = set([(c.split(":")[0] if ":" in c else c)
-                    for c in cnt.get("links", [])])
-        deps.update(cnt.get("depends_on", []))
-        cnt["_deps"] = deps
-    for name, cnt in container_by_name.items():
-        rec_deps(services, container_by_name, cnt, cnt.get('_service'))
+def flat_deps(services, with_extends=False):
+    """
+    create dependencies "_deps" or update it recursively for all services
+    """
+    for name, srv in services.items():
+        deps = set()
+        srv["_deps"] = deps
+        if with_extends:
+            ext = srv.get("extends", {}).get("service", None)
+            if ext:
+                if ext != name: deps.add(ext)
+                continue
+        deps.update(srv.get("depends_on", []))
+        # parse link to get service name and remove alias
+        deps.update([(c.split(":")[0] if ":" in c else c)
+            for c in srv.get("links", [])])
+    for name, srv in services.items():
+        rec_deps(services, name)
 
 ###################
 # podman and compose classes
@@ -554,16 +629,17 @@ class Podman:
         self.compose = compose
         self.podman_path = podman_path
         self.dry_run = dry_run
-    
+
     def output(self, podman_args):
         cmd = [self.podman_path]+podman_args
         return subprocess.check_output(cmd)
 
     def run(self, podman_args, wait=True, sleep=1):
-        print("podman " + " ".join(podman_args))
+        podman_args_str = [str(arg) for arg in podman_args]
+        print("podman " + " ".join(podman_args_str))
         if self.dry_run:
             return None
-        cmd = [self.podman_path]+podman_args
+        cmd = [self.podman_path]+podman_args_str
         # subprocess.Popen(args, bufsize = 0, executable = None, stdin = None, stdout = None, stderr = None, preexec_fn = None, close_fds = False, shell = False, cwd = None, env = None, universal_newlines = False, startupinfo = None, creationflags = 0)
         p = subprocess.Popen(cmd)
         if wait:
@@ -571,6 +647,87 @@ class Podman:
         if sleep:
             time.sleep(sleep)
         return p
+
+def normalize_service(service):
+    for key in ("env_file", "security_opt"):
+        if key not in service: continue
+        if is_str(service[key]): service[key]=[service[key]]
+    for key in ("environment", "labels"):
+        if key not in service: continue
+        service[key] = norm_as_dict(service[key])
+    if "extends" in service:
+        extends = service["extends"]
+        if is_str(extends):
+            extends = {"service": extends}
+            service["extends"] = extends
+    return service
+
+def normalize(compose):
+    """
+    convert compose dict of some keys from string or dicts into arrays
+    """
+    services = compose.get("services", None) or {}
+    for service_name, service in services.items():
+        normalize_service(service)
+    return compose
+
+def rec_merge_one(target, source):
+    """
+    update target from source recursively
+    """
+    done = set()
+    for key, value in source.items():
+        if key in target: continue
+        target[key]=value
+        done.add(key)
+    for key, value in target.items():
+        if key in done: continue
+        if key not in source: continue
+        value2 = source[key]
+        if type(value2)!=type(value):
+            raise ValueError("can't merge value of {} of type {} and {}".format(key, type(value), type(value2)))
+        if is_list(value2):
+            value.extend(value2)
+        elif is_dict(value2):
+            rec_merge_one(value, value2)
+        else:
+            target[key]=value2
+    return target
+
+def rec_merge(target, *sources):
+    """
+    update target recursively from sources
+    """
+    for source in sources:
+        ret = rec_merge_one(target, source)
+    return ret
+
+def resolve_extends(services, service_names, dotenv_dict):
+    for name in service_names:
+        service = services[name]
+        ext = service.get("extends", {})
+        if is_str(ext): ext = {"service": ext}
+        from_service_name = ext.get("service", None)
+        if not from_service_name: continue
+        filename = ext.get("file", None)
+        if filename:
+            with open(filename, 'r') as f:
+                content = yaml.safe_load(f) or {}
+            if "services" in content:
+                content = content["services"]
+            content = rec_subs(content, [os.environ, dotenv_dict])
+            from_service = content.get(from_service_name, {})
+            normalize_service(from_service)
+        else:
+            from_service = services.get(from_service_name, {}).copy()
+            del from_service["_deps"]
+            try:
+                del from_service["extends"]
+            except KeyError:
+                pass
+        new_service = rec_merge({}, from_service, service)
+        services[name] = new_service
+
 
 class PodmanCompose:
     def __init__(self):
@@ -605,21 +762,35 @@ class PodmanCompose:
     def _parse_compose_file(self):
         args = self.global_args
         cmd = args.command
-        filename = args.file
+        if not args.file:
+            args.file = list(filter(os.path.exists, [
+                "docker-compose.yml",
+                "docker-compose.yaml",
+                "docker-compose.override.yml",
+                "docker-compose.override.yaml",
+                "container-compose.yml",
+                "container-compose.yaml",
+                "container-compose.override.yml",
+                "container-compose.override.yaml"
+            ]))
+        files = args.file
+        if not files:
+            print("no docker-compose.yml or container-compose.yml file found, pass files with -f")
+            exit(-1)
+        ex = map(os.path.exists, files)
+        missing = [ fn0 for ex0, fn0 in zip(ex, files) if not ex0 ]
+        if missing:
+            print("missing files: ", missing)
+            exit(1)
+        # make absolute
+        files = list(map(os.path.realpath, files))
+        filename = files[0]
         project_name = args.project_name
         no_ansi = args.no_ansi
         no_cleanup = args.no_cleanup
         dry_run = args.dry_run
         transform_policy = args.transform_policy
         host_env = None
-        if not os.path.exists(filename):
-            alt_path = filename.replace('.yml', '.yaml')
-            if os.path.exists(alt_path):
-                filename = alt_path
-            else:
-                print("file [{}] not found".format(filename))
-                exit(-1)
-        filename = os.path.realpath(filename)
         dirname = os.path.dirname(filename)
         dir_basename = os.path.basename(dirname)
         self.dirname = dirname
@@ -627,9 +798,9 @@ class PodmanCompose:
         os.chdir(dirname)
 
         if not project_name:
-            project_name = dir_basename
+            project_name = dir_basename.lower()
         self.project_name = project_name
-        
+
 
         dotenv_path = os.path.join(dirname, ".env")
         if os.path.exists(dotenv_path):
@@ -638,15 +809,28 @@ class PodmanCompose:
                 dotenv_dict = dict([l.split("=", 1) for l in dotenv_ls if "=" in l])
         else:
             dotenv_dict = {}
-
-        with open(filename, 'r') as f:
-            compose = rec_subs(yaml.safe_load(f), [os.environ, dotenv_dict])
-        compose['_dirname']=dirname
+        compose={'_dirname': dirname}
+        for filename in files:
+            with open(filename, 'r') as f:
+                content = yaml.safe_load(f)
+                #print(filename, json.dumps(content, indent = 2))
+                content = normalize(content)
+                #print(filename, json.dumps(content, indent = 2))
+                content = rec_subs(content, [os.environ, dotenv_dict])
+                rec_merge(compose, content)
         # debug mode
-        #print(json.dumps(compose, indent = 2))
-
+        if len(files)>1:
+            print(" ** merged:\n", json.dumps(compose, indent = 2))
         ver = compose.get('version')
         services = compose.get('services')
+        # NOTE: maybe add "extends.service" to _deps at this stage
+        flat_deps(services, with_extends=True)
+        service_names = sorted([ (len(srv["_deps"]), name) for name, srv in services.items() ])
+        service_names = [ name for _, name in service_names]
+        resolve_extends(services, service_names, dotenv_dict)
+        flat_deps(services)
+        service_names = sorted([ (len(srv["_deps"]), name) for name, srv in services.items() ])
+        service_names = [ name for _, name in service_names]
         # volumes: [...]
         shared_vols = compose.get('volumes', {})
         # shared_vols = list(shared_vols.keys())
@@ -697,7 +881,6 @@ class PodmanCompose:
                 given_containers.append(cnt)
         self.container_names_by_service = container_names_by_service
         container_by_name = dict([(c["name"], c) for c in given_containers])
-        flat_deps(container_names_by_service, container_by_name)
         #print("deps:", [(c["name"], c["_deps"]) for c in given_containers])
         given_containers = list(container_by_name.values())
         given_containers.sort(key=lambda c: len(c.get('_deps') or []))
@@ -714,19 +897,21 @@ class PodmanCompose:
         parser = argparse.ArgumentParser()
         self._init_global_parser(parser)
         subparsers = parser.add_subparsers(title='command', dest='command')
-        subparsers.default = 'up'
+        subparser = subparsers.add_parser('help', help='show help')
         for cmd_name, cmd in self.commands.items():
             subparser = subparsers.add_parser(cmd_name, help=cmd._cmd_desc)
             for cmd_parser in cmd._parse_args:
                 cmd_parser(subparser)
         self.global_args = parser.parse_args()
+        if not self.global_args.command or self.global_args.command=='help':
+            parser.print_help()
+            exit(-1)
         return self.global_args
 
     def _init_global_parser(self, parser):
-        parser.add_argument('args', nargs=argparse.REMAINDER)
         parser.add_argument("-f", "--file",
                             help="Specify an alternate compose file (default: docker-compose.yml)",
-                            type=str, default="docker-compose.yml")
+                            metavar='file', action='append', default=[])
         parser.add_argument("-p", "--project-name",
                             help="Specify an alternate project name (default: directory name)",
                             type=str, default=None)
@@ -780,6 +965,11 @@ class cmd_parse:
 # actual commands
 ###################
 
+@cmd_run(podman_compose, 'version', 'show version')
+def compose_version(compose, args):
+    print("podman-composer version ", __version__)
+    compose.podman.run(["--version"], sleep=0)
+
 @cmd_run(podman_compose, 'pull', 'pull stack images')
 def compose_pull(compose, args):
     for cnt in compose.containers:
@@ -794,32 +984,37 @@ def compose_push(compose, args):
         if services and cnt['_service'] not in services: continue
         compose.podman.run(["push", cnt["image"]], sleep=0)
 
+def build_one(compose, args, cnt):
+    if 'build' not in cnt: return
+    if getattr(args, 'if_not_exists', None):
+        try: img_id = compose.podman.output(['inspect', '-t', 'image', '-f', '{{.Id}}', cnt["image"]])
+        except subprocess.CalledProcessError: img_id = None
+        if img_id: return
+    build_desc = cnt['build']
+    if not hasattr(build_desc, 'items'):
+        build_desc = dict(context=build_desc)
+    ctx = build_desc.get('context', '.')
+    dockerfile = os.path.join(ctx, build_desc.get("dockerfile", "Dockerfile"))
+    if not os.path.exists(dockerfile):
+        dockerfile = os.path.join(ctx, build_desc.get("dockerfile", "dockerfile"))
+        if not os.path.exists(dockerfile):
+            raise OSError("Dockerfile not found in "+ctx)
+    build_args = [
+        "build", "-t", cnt["image"],
+        "-f", dockerfile
+    ]
+    if getattr(args, 'pull_always', None): build_args.append("--pull-always")
+    elif getattr(args, 'pull', None): build_args.append("--pull")
+    args_list = norm_as_list(build_desc.get('args', {}))
+    for build_arg in args_list:
+        build_args.extend(("--build-arg", build_arg,))
+    build_args.append(ctx)
+    compose.podman.run(build_args, sleep=0)
+
 @cmd_run(podman_compose, 'build', 'build stack images')
 def compose_build(compose, args):
-    podman_args = []
-    if args.pull_always: podman_args.append("--pull-always")
-    elif args.pull: podman_args.append("--pull")
     for cnt in compose.containers:
-        if 'build' not in cnt: continue
-        build_desc = cnt['build']
-        if not hasattr(build_desc, 'items'):
-            build_desc = dict(context=build_desc)
-        ctx = build_desc.get('context', '.')
-        dockerfile = os.path.join(ctx, build_desc.get("dockerfile", "Dockerfile"))
-        if not os.path.exists(dockerfile):
-            dockerfile = os.path.join(ctx, build_desc.get("dockerfile", "dockerfile"))
-            if not os.path.exists(dockerfile):
-                raise OSError("Dockerfile not found in "+ctx)
-        build_args = [
-            "build", "-t", cnt["image"],
-            "-f", dockerfile
-        ]
-        build_args.extend(podman_args)
-        args_list = norm_as_list(build_desc.get('args', {}))
-        for build_arg in args_list:
-            build_args.extend(("--build-arg", build_arg,))
-        build_args.append(ctx)
-        compose.podman.run(build_args, sleep=0)
+        build_one(compose, args, cnt)
 
 def create_pods(compose, args):
     for pod in compose.pods:
@@ -833,24 +1028,60 @@ def create_pods(compose, args):
             podman_args.extend(['-p', i])
         compose.podman.run(podman_args)
 
+def up_specific(compose, args):
+    deps = []
+    if not args.no_deps:
+        for service in args.services:
+            deps.extend([])
+    # args.always_recreate_deps
+    print("services", args.services)
+    raise NotImplementedError("starting specific services is not yet implemented")
+
 @cmd_run(podman_compose, 'up', 'Create and start the entire stack or some of its services')
 def compose_up(compose, args):
-    shared_vols = compose.shared_vols
-    
-    # NOTE: podman does not cache, so don't always build
-    # TODO: if build and the following command fails "podman inspect -t image <image_name>" then run build
+    if args.services:
+        return up_specific(compose, args)
 
-    # no need remove them if they have same hash label
-    if compose.global_args.no_cleanup == False:
+    if not args.no_build:
+        # `podman build` does not cache, so don't always build
+        build_args = argparse.Namespace(
+            if_not_exists=(not args.build),
+            **args.__dict__,
+        )
+        compose.commands['build'](compose, build_args)
+
+    shared_vols = compose.shared_vols
+
+    # TODO: implement check hash label for change
+    if args.force_recreate:
         compose.commands['down'](compose, args)
+    # args.no_recreate disables check for changes (which is not implemented)
+
+    podman_command = 'run' if args.detach and not args.no_start else 'create'
 
     create_pods(compose, args)
-
     for cnt in compose.containers:
-        # TODO: -e , --add-host, -v, --read-only
-        podman_args = container_to_args(compose, cnt)
+        podman_args = container_to_args(compose, cnt,
+            detached=args.detach, podman_command=podman_command)
         compose.podman.run(podman_args)
+    if args.no_start or args.detach or args.dry_run: return
+    # TODO: handle already existing
+    # TODO: if error creating do not enter loop
+    # TODO: colors if sys.stdout.isatty()
 
+    threads = []
+    for cnt in compose.containers:
+        # TODO: remove sleep from podman.run
+        thread = Thread(target=compose.podman.run, args=[['start', '-a', cnt['name']]], daemon=True)
+        thread.start()
+        threads.append(thread)
+        time.sleep(1)
+    while True:
+        for thread in threads:
+            thread.join(timeout=1.0)
+            if thread.is_alive(): continue
+            if args.abort_on_container_exit:
+                exit(-1)
 
 @cmd_run(podman_compose, 'down', 'tear down entire stack')
 def compose_down(compose, args):
@@ -860,6 +1091,14 @@ def compose_down(compose, args):
         compose.podman.run(["rm", cnt["name"]], sleep=0)
     for pod in compose.pods:
         compose.podman.run(["pod", "rm", pod["name"]], sleep=0)
+
+@cmd_run(podman_compose, 'ps', 'show status of containers')
+def compose_ps(compose, args):
+    proj_name = compose.project_name
+    if args.quiet == True:
+        compose.podman.run(["ps", "-a", "--format", "{{.ID}}", "--filter", f"label=io.podman.compose.project={proj_name}"])
+    else:
+        compose.podman.run(["ps", "-a", "--filter", f"label=io.podman.compose.project={proj_name}"])
 
 @cmd_run(podman_compose, 'run', 'create a container similar to a service to run a one-off command')
 def compose_run(compose, args):
@@ -886,7 +1125,8 @@ def compose_run(compose, args):
         # TODO: handle volumes
         pass
     cnt['tty']=False if args.T else True
-    cnt['command']=args.command
+    if args.cnt_command is not None and len(args.cnt_command) > 0:
+        cnt['command']=args.cnt_command
     # run podman
     podman_args = container_to_args(compose, cnt, args.detach)
     if not args.detach:
@@ -894,7 +1134,7 @@ def compose_run(compose, args):
         if args.rm:
             podman_args.insert(1, '--rm')
     compose.podman.run(podman_args, sleep=0)
-    
+
 
 def transfer_service_status(compose, args, action):
     # TODO: handle dependencies, handle creations
@@ -917,15 +1157,71 @@ def compose_start(compose, args):
 
 @cmd_run(podman_compose, 'stop', 'stop specific services')
 def compose_stop(compose, args):
-    transfer_service_status(compose, args, 'start')
+    transfer_service_status(compose, args, 'stop')
 
 @cmd_run(podman_compose, 'restart', 'restart specific services')
 def compose_restart(compose, args):
     transfer_service_status(compose, args, 'restart')
 
+@cmd_run(podman_compose, 'logs', 'show logs from services')
+def compose_logs(compose, args):
+    container_names_by_service = compose.container_names_by_service
+    target = None
+    if args.service not in container_names_by_service:
+        raise ValueError("unknown service: " + args.service)
+    target = container_names_by_service[args.service]
+    podman_args = ['logs']
+    if args.follow:
+        podman_args.append('-f')
+    # the default value is to print all logs which is in podman = 0 and not
+    # needed to be passed
+    if args.tail and args.tail != 'all':
+        podman_args.extend(['--tail', args.tail])
+    if args.timestamps:
+        podman_args.append('-t')
+    compose.podman.run(podman_args+target)
+
 ###################
 # command arguments parsing
 ###################
+
+@cmd_parse(podman_compose, 'up')
+def compose_up_parse(parser):
+    parser.add_argument("-d", "--detach", action='store_true',
+        help="Detached mode: Run container in the background, print new container name. Incompatible with --abort-on-container-exit.")
+    parser.add_argument("--no-color", action='store_true',
+        help="Produce monochrome output.")
+    parser.add_argument("--quiet-pull", action='store_true',
+        help="Pull without printing progress information.")
+    parser.add_argument("--no-deps", action='store_true',
+        help="Don't start linked services.")
+    parser.add_argument("--force-recreate", action='store_true',
+        help="Recreate containers even if their configuration and image haven't changed.")
+    parser.add_argument("--always-recreate-deps", action='store_true',
+        help="Recreate dependent containers. Incompatible with --no-recreate.")
+    parser.add_argument("--no-recreate", action='store_true',
+        help="If containers already exist, don't recreate them. Incompatible with --force-recreate and -V.")
+    parser.add_argument("--no-build", action='store_true',
+        help="Don't build an image, even if it's missing.")
+    parser.add_argument("--no-start", action='store_true',
+        help="Don't start the services after creating them.")
+    parser.add_argument("--build", action='store_true',
+        help="Build images before starting containers.")
+    parser.add_argument("--abort-on-container-exit", action='store_true',
+        help="Stops all containers if any container was stopped. Incompatible with -d.")
+    parser.add_argument("-t", "--timeout", type=float, default=10,
+        help="Use this timeout in seconds for container shutdown when attached or when containers are already running. (default: 10)")
+    parser.add_argument("-V", "--renew-anon-volumes", action='store_true',
+        help="Recreate anonymous volumes instead of retrieving data from the previous containers.")
+    parser.add_argument("--remove-orphans", action='store_true',
+        help="Remove containers for services not defined in the Compose file.")
+    parser.add_argument('--scale', metavar="SERVICE=NUM", action='append',
+        help="Scale SERVICE to NUM instances. Overrides the `scale` setting in the Compose file if present.")
+    parser.add_argument("--exit-code-from", metavar='SERVICE', type=str, default=None,
+        help="Return the exit code of the selected service container. Implies --abort-on-container-exit.")
+    parser.add_argument('services', metavar='SERVICES', nargs='*',
+        help='service names to start')
+
 
 @cmd_parse(podman_compose, 'run')
 def compose_run_parse(parser):
@@ -957,8 +1253,8 @@ def compose_run_parse(parser):
         help="Working directory inside the container")
     parser.add_argument('service', metavar='service', nargs=None,
         help='service name')
-    parser.add_argument('command', metavar='command', nargs=argparse.REMAINDER,
-        help='comman and its args')
+    parser.add_argument('cnt_command', metavar='command', nargs=argparse.REMAINDER,
+        help='command and its arguments')
 
 @cmd_parse(podman_compose, ['stop', 'restart'])
 def compose_parse_timeout(parser):
@@ -971,6 +1267,19 @@ def compose_parse_services(parser):
     parser.add_argument('services', metavar='services', nargs='+',
         help='affected services')
 
+@cmd_parse(podman_compose, ['logs'])
+def compose_logs_parse(parser):
+    parser.add_argument("-f", "--follow", action='store_true',
+                        help="Follow log output.")
+    parser.add_argument("-t", "--timestamps", action='store_true',
+                        help="Show timestamps.")
+    parser.add_argument("--tail",
+        help="Number of lines to show from the end of the logs for each "
+             "container.",
+        type=str, default="all")
+    parser.add_argument('service', metavar='service', nargs=None,
+        help='service name')
+
 @cmd_parse(podman_compose, 'push')
 def compose_push_parse(parser):
     parser.add_argument("--ignore-push-failures", action='store_true',
@@ -978,6 +1287,10 @@ def compose_push_parse(parser):
     parser.add_argument('services', metavar='services', nargs='*',
         help='services to push')
 
+@cmd_parse(podman_compose, 'ps')
+def compose_ps_parse(parser):
+    parser.add_argument("-q", "--quiet",
+        help="Only display container IDs", action='store_true')
 
 @cmd_parse(podman_compose, 'build')
 def compose_build_parse(parser):

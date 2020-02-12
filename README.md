@@ -1,51 +1,101 @@
-# PodMan-Compose
+# Podman Compose
 
-A script to run `docker-compose.yml` using [podman](https://podman.io/),
-doing necessary mapping to make it work rootless.
+An implementation of `docker-compose` with [podman](https://podman.io/) backend.
+The main objective of this project is to be able to run `docker-compose.yml` unmodified and rootless.
+This project is aimed to provide drop-in replacement for `docker-compose`,
+and it's very useful for certain cases because:
+
+- can run rootless
+- only depend on `podman` and Python3 and [PyYAML](https://pyyaml.org/)
+- no daemon, no setup.
+- can be used by developers to run single-machine containerized stacks using single familiar YAML file
+
+For production-like single-machine containerized environment consider
+
+- [k3s](https://k3s.io) | [k3s github](https://github.com/rancher/k3s)
+- [MiniKube](https://minikube.sigs.k8s.io/)
+- [MiniShift](https://www.okd.io/minishift/)
+
+
+For the real thing (multi-node clusters) check any production
+OpenShift/Kubernetes distribution like [OKD](https://www.okd.io/minishift/).
 
 ## NOTE
 
-it's still underdevelopment and does not work yet.
+This project is still underdevelopment.
 
-## Mappings
+## Installation
 
-* `1podfw` - create all containers in one pod (inter-container communication is done via `localhost`), doing port mapping in that pod
-* `1pod` - create all containers in one pod, doing port mapping in each container
-* `identity` - no mapping
-* `hostnet` - use host network, and inter-container communication is done via host gateway and published ports
-* `cntnet` - create a container and use it via `--network container:name` (inter-container communication via `localhost`)
-* `publishall` - publish all ports to host (using `-P`) and communicate via gateway
-
-## Examples
-
-When testing the `AWX`, if you got errors just wait for db migrations to end. 
-
-### Working Example
-
-Tested on latest podman (commit `349e69..` on 2019-03-11)
-
-By using many containers on a single pod that shares the network (services talk via localhost)
+Install latest stable version from PyPI:
 
 ```
-./podman-compose.py -t 1podfw -f examples/awx3/docker-compose.yml up
+pip3 install podman-compose
 ```
 
-Or by reusing a container network and `--add-host`
+pass `--user` to install inside regular user home without being root.
+
+Or latest development version from GitHub:
 
 ```
-$ ./podman-compose.py -t cntnet -f examples/awx3/docker-compose.yml up
+pip3 install https://github.com/containers/podman-compose/archive/devel.tar.gz
 ```
 
-Or by using host network and localhost works as in
+or
 
 ```
-$ ./podman-compose.py -t hostnet -f examples/awx3-hostnet-localhost/docker-compose.yml up
+curl -o /usr/local/bin/podman-compose https://raw.githubusercontent.com/containers/podman-compose/devel/podman_compose.py
+chmod +x /usr/local/bin/podman-compose
 ```
 
-### in progress work
-
+or 
 
 ```
-./podman-compose.py -t 1pod -f examples/awx3/docker-compose.yml up
+curl -o ~/.local/bin/podman-compose https://raw.githubusercontent.com/containers/podman-compose/devel/podman_compose.py
+chmod +x ~/.local/bin/podman-compose
 ```
+
+or install from Fedora (starting from f31) repositories:
+
+```
+sudo dnf install podman-compose
+```
+
+## Basic Usage
+
+We have included fully functional sample stacks inside `examples/` directory.
+
+A quick example would be
+
+```
+cd examples/busybox
+podman-compose --help
+podman-compose up --help
+podman-compose up
+```
+
+A more rich example can be found in [examples/awx3](examples/awx3)
+which have
+
+- A Postgres Database
+- RabbitMQ server
+- MemCached server
+- a django web server
+- a django tasks
+
+
+When testing the `AWX3` example, if you got errors just wait for db migrations to end. 
+
+
+## Tests
+
+Inside `tests/` directory we have many useless docker-compose stacks
+that are meant to test as much cases as we can to make sure we are compatible
+
+## How it works
+
+The default mapping `1podfw` creates a single pod and attach all containers to
+its network namespace so that all containers talk via localhost.
+For more information see [docs/Mappings.md](docs/Mappings.md).
+
+If you are running as root, you might use identity mapping.
 
