@@ -1,16 +1,16 @@
 import os
-from setuptools import setup, find_packages
+from setuptools import setup
 
 try:
     readme = open(os.path.join(os.path.dirname(__file__), 'README.md')).read()
 except:
     readme = ''
 
-version = '0.1.3'
+from podman_compose import __version__ as podman_compose_version
 
 setup(
     name='podman-compose',
-    version=version,
+    version=podman_compose_version,
     description="A script to run docker-compose.yml using podman",
     long_description=readme,
     long_description_content_type='text/markdown',
@@ -31,7 +31,7 @@ setup(
     keywords='podman, podman-compose',
     author='Muayyad Alsadi',
     author_email='alsadi@gmail.com',
-    url='https://github.com/muayyad-alsadi/podman-compose',
+    url='https://github.com/containers/podman-compose',
     py_modules=['podman_compose'],
     entry_points={
         'console_scripts': [
