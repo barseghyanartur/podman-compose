@@ -893,11 +893,7 @@ class PodmanCompose:
         if services is None:
             services = {}
             print("WARNING: No services defined")
-<<<<<<< HEAD
-        
-=======
-		
->>>>>>> 294f8ee37bb37ab0535558182cf41d99dfb3cb11
+
         # NOTE: maybe add "extends.service" to _deps at this stage
         flat_deps(services, with_extends=True)
         service_names = sorted([ (len(srv["_deps"]), name) for name, srv in services.items() ])
