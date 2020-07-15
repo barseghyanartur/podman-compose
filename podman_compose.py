@@ -172,6 +172,10 @@ def rec_subs(value, dicts):
     if is_dict(value):
         value = dict([(k, rec_subs(v, dicts)) for k, v in value.items()])
     elif is_str(value):
+        wrapped_in_quotes = value.startswith('"') and value.endswith('"')
+        if wrapped_in_quotes:
+            value = value[1:-1]
+
         value = var_re.sub(lambda m: dicts_get(dicts, m.group(1).strip('{}')), value)
         sub_def = lambda m: dicts_get(dicts, m.group(1), m.group(3), m.group(2) == ':')
         value = var_def_re.sub(sub_def, value)
@@ -179,6 +183,9 @@ def rec_subs(value, dicts):
                                       m.group(2) == ':')
         value = var_err_re.sub(sub_err, value)
         value = value.replace('$$', '$')
+        if wrapped_in_quotes:
+            value = f'"{value}"'
+
     elif hasattr(value, "__iter__"):
         value = [rec_subs(i, dicts) for i in value]
     return value
